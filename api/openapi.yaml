@@ -1,0 +1,557 @@
+openapi: 3.1.0
+info:
+  title: Subscription Tracking and Appointment System API
+  version: 0.3.0
+  description: |
+    Conventions:
+    - The authenticated user (user_id) and the user's base currency are taken from the
+      Bearer JWT claims (`sub` and `baseCurrency`); they are never sent in request bodies.
+    - Optimistic locking: every single-resource GET and every successful create/update/state change
+      returns an `ETag` header. Mutating calls on an existing resource require `If-Match`;
+      a mismatch returns 412 Precondition Failed.
+    - Subscription DELETE is a hard delete. To keep a record, set status to CANCELLED via PATCH.
+      Deleting a subscription also deletes its reminders (cascade).
+    - Appointments are never hard-deleted; they are cancelled via POST /appointments/{id}/cancel
+      (status becomes CANCELLED and the history is preserved).
+    - Reminder alert triggers are produced by an internal scheduler that calls the Notification
+      Provider (a local stub in Sprint 1). They are not exposed as API endpoints; the outcome is
+      visible through Reminder.status (PENDING, SENT, FAILED).
+    - Appointment conflict: a requested slot conflicts with another PENDING or CONFIRMED
+      appointment of the same user, excluding the appointment being rescheduled. CANCELLED
+      appointments do not block.
+    - Appointment time validity: endTime must be later than startTime when booking or
+      rescheduling; otherwise the API returns 400.
+    - Resource access: requests for another user's resource return 404 to prevent ID probing.
+
+paths:
+  /auth/login:
+    post:
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: user@example.com }
+                password: { type: string, example: secret123 }
+      responses:
+        '200':
+          description: Successful authentication. The JWT carries the `sub` and `baseCurrency` claims.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token: { type: string, example: eyJhbGciOiJIUzI1NiIs... }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /subscriptions:
+    get:
+      operationId: listSubscriptions
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          required: false
+          schema: { type: string, enum: [ACTIVE, PAUSED, CANCELLED] }
+      responses:
+        '200':
+          description: Matching subscriptions of the authenticated user (empty array if none)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createSubscription
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewSubscription' }
+      responses:
+        '201':
+          description: Subscription created
+          headers:
+            ETag:
+              schema: { type: string }
+              description: Entity tag for optimistic locking
+            Location:
+              schema: { type: string }
+              description: URL of the created subscription
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: Invalid request, including `currency` not equal to the user's base currency (code CURRENCY_MISMATCH)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Subscription already exists (unique constraint on authenticated user + name)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /subscriptions/{id}:
+    get:
+      operationId: getSubscription
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: The subscription with its current ETag
+          headers:
+            ETag:
+              schema: { type: string }
+              description: Current entity tag; send it back in If-Match
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateSubscription
+      description: Partial update; omitted fields keep their current values. At least one field is required.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateSubscription' }
+      responses:
+        '200':
+          description: Subscription updated successfully
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: Invalid request (empty body, invalid values, or currency not equal to the user's base currency)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Name conflict with another existing subscription
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+    delete:
+      operationId: deleteSubscription
+      description: Hard delete; also deletes the subscription's reminders (cascade). To keep the record, set status to CANCELLED with PATCH instead.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Subscription successfully deleted
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /subscriptions/{id}/history:
+    get:
+      operationId: getSubscriptionHistory
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Auditable status history logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [timestamp, action, details]
+                  properties:
+                    timestamp: { type: string, format: date-time }
+                    action: { type: string, example: STATUS_CHANGED }
+                    details: { type: string, example: Status changed from ACTIVE to PAUSED }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments:
+    get:
+      operationId: listAppointments
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          required: false
+          schema: { type: string, enum: [PENDING, CONFIRMED, CANCELLED] }
+      responses:
+        '200':
+          description: List of user appointments (empty array if none)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Appointment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createAppointment
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewAppointment' }
+      responses:
+        '201':
+          description: Appointment booked (default status PENDING)
+          headers:
+            ETag:
+              schema: { type: string }
+            Location:
+              schema: { type: string }
+              description: URL of the created appointment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Appointment' }
+        '400':
+          description: Invalid request, including endTime not later than startTime
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Requested slot conflicts with an active booking
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /appointments/{id}:
+    get:
+      operationId: getAppointment
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: The appointment with its current ETag
+          headers:
+            ETag:
+              schema: { type: string }
+              description: Current entity tag; send it back in If-Match
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Appointment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: rescheduleAppointment
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [startTime, endTime]
+              properties:
+                startTime: { type: string, format: date-time }
+                endTime: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Appointment rescheduled successfully
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Appointment' }
+        '400':
+          description: Invalid request, including endTime not later than startTime
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Time slot conflict, or the appointment is CANCELLED (code APPOINTMENT_CANCELLED)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /appointments/{id}/confirm:
+    post:
+      operationId: confirmAppointment
+      description: Moves a PENDING appointment to CONFIRMED.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Appointment confirmed
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Appointment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Invalid state transition or rule violation (appointment is already CANCELLED, or its start time is in the past)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /appointments/{id}/cancel:
+    post:
+      operationId: cancelAppointment
+      description: Soft cancel. Sets status to CANCELLED and frees the slot; the record is kept.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: Appointment cancelled
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Appointment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Appointment is already CANCELLED
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /reminders:
+    get:
+      operationId: listReminders
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of scheduled renewal reminders and history
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Reminder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createReminder
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscriptionId, alertDate]
+              properties:
+                subscriptionId: { type: string, example: SUB-01 }
+                alertDate: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Reminder created successfully (status PENDING)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reminder' }
+        '400':
+          description: Invalid request, including alertDate in the past
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: A reminder for the same subscription and alertDate already exists
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /reports/spending:
+    get:
+      operationId: getMonthlySpendingSummary
+      description: Spending is calculated strictly in the user's base currency.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: month
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^(19|20)\d{2}-(0[1-9]|1[0-2])$'
+            example: '2026-10'
+      responses:
+        '200':
+          description: Monthly spending summary report with category breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [baseCurrency, totalMonthly, breakdown]
+                properties:
+                  baseCurrency: { type: string, example: TRY }
+                  totalMonthly: { type: number, minimum: 0, example: 450.00 }
+                  breakdown:
+                    type: array
+                    items:
+                      type: object
+                      required: [category, amount]
+                      properties:
+                        category: { type: string, example: Entertainment }
+                        amount: { type: number, minimum: 0, example: 149.99 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string }
+      description: Exact ETag value from a previous GET or write response, for optimistic locking. The wildcard `*` is not accepted.
+
+  schemas:
+    Subscription:
+      type: object
+      required: [id, name, price, currency, billingCycle, renewalDate, status]
+      properties:
+        id: { type: string, example: SUB-01 }
+        name: { type: string, example: Netflix }
+        price: { type: number, minimum: 0, example: 149.99 }
+        currency: { type: string, description: Must equal the user's base currency, example: TRY }
+        billingCycle: { type: string, enum: [MONTHLY, YEARLY, WEEKLY] }
+        renewalDate: { type: string, format: date-time }
+        status: { type: string, enum: [ACTIVE, PAUSED, CANCELLED], default: ACTIVE, example: ACTIVE }
+        category: { type: string, example: Entertainment }
+    NewSubscription:
+      type: object
+      required: [name, price, currency, billingCycle, renewalDate]
+      properties:
+        name: { type: string, example: Netflix }
+        price: { type: number, minimum: 0, example: 149.99 }
+        currency: { type: string, description: Must equal the user's base currency, example: TRY }
+        billingCycle: { type: string, enum: [MONTHLY, YEARLY, WEEKLY] }
+        renewalDate: { type: string, format: date-time }
+        category: { type: string, example: Entertainment }
+    UpdateSubscription:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, example: Netflix }
+        price: { type: number, minimum: 0, example: 149.99 }
+        currency: { type: string, description: Must equal the user's base currency, example: TRY }
+        billingCycle: { type: string, enum: [MONTHLY, YEARLY, WEEKLY] }
+        renewalDate: { type: string, format: date-time }
+        status: { type: string, enum: [ACTIVE, PAUSED, CANCELLED], example: PAUSED }
+        category: { type: string, example: Entertainment }
+    Appointment:
+      type: object
+      required: [id, title, startTime, endTime, status]
+      properties:
+        id: { type: string, example: APT-101 }
+        title: { type: string, example: Personal Training }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time }
+        status: { type: string, enum: [PENDING, CONFIRMED, CANCELLED], default: PENDING, example: PENDING }
+    NewAppointment:
+      type: object
+      required: [title, startTime, endTime]
+      properties:
+        title: { type: string, example: Personal Training }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time }
+    Reminder:
+      type: object
+      required: [id, subscriptionId, alertDate, status]
+      properties:
+        id: { type: string, example: REM-01 }
+        subscriptionId: { type: string, example: SUB-01 }
+        alertDate: { type: string, format: date-time }
+        status: { type: string, enum: [PENDING, SENT, FAILED], example: PENDING }
+    Problem:
+      type: object
+      description: RFC 9457 problem details. Every error response includes a machine-readable `code`.
+      required: [title, status, code]
+      properties:
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: SLOT_UNAVAILABLE }
+        detail: { type: string }
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Requested resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PreconditionFailed:
+      description: Precondition failed due to ETag / If-Match mismatch (concurrency conflict)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
