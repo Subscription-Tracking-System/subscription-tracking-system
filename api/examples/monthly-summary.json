@@ -1,0 +1,48 @@
+{
+  "description": "Synthetic first-release calculation fixture, not live market rates or a running API response.",
+  "rateSetId": "sprint-1-fixed-v1",
+  "tryPerUnit": {"TRY": "1", "USD": "35", "EUR": "40"},
+  "subscriptions": [
+    {
+      "id": "SUB-8091",
+      "name": "Netflix",
+      "price": 15.99,
+      "currency": "USD",
+      "billingCycle": "MONTHLY",
+      "renewalDate": "2026-11-01T09:00:00Z",
+      "status": "ACTIVE"
+    },
+    {
+      "id": "SUB-8092",
+      "name": "Annual Cloud Plan",
+      "price": 1200,
+      "currency": "TRY",
+      "billingCycle": "YEARLY",
+      "renewalDate": "2027-01-15T09:00:00Z",
+      "status": "ACTIVE"
+    },
+    {
+      "id": "SUB-8093",
+      "name": "Paused Service",
+      "price": 999,
+      "currency": "TRY",
+      "billingCycle": "MONTHLY",
+      "renewalDate": "2026-11-05T09:00:00Z",
+      "status": "PAUSED"
+    },
+    {
+      "id": "SUB-8094",
+      "name": "Cancelled Service",
+      "price": 10,
+      "currency": "EUR",
+      "billingCycle": "MONTHLY",
+      "renewalDate": "2026-11-10T09:00:00Z",
+      "status": "CANCELLED"
+    }
+  ],
+  "expectedSummaries": [
+    {"totalMonthlyExpense": 659.65, "baseCurrency": "TRY", "activeSubscriptionsCount": 2},
+    {"totalMonthlyExpense": 18.85, "baseCurrency": "USD", "activeSubscriptionsCount": 2},
+    {"totalMonthlyExpense": 16.49, "baseCurrency": "EUR", "activeSubscriptionsCount": 2}
+  ]
+}
